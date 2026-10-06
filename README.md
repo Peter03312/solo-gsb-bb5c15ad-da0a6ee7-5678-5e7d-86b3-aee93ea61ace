@@ -19,6 +19,10 @@
   发起**执行差异复核**（`POST /inventory/plans/{id}/reviews`）：逐步比对冻结
   计划，输出每步匹配结果、首个缺失/多余/不一致位置与冻结/实际库存转出汇总，
   封存不可变复核报告；复核只读，不改库存、计划或已登记步骤。
+  实验员还可凭批次号 + 唯一盘点单号 + 实测可用体积对母液批次做**库存盘点**
+  （`POST /batches/{id}/stocktakes`）：盘亏只从未预留的可用量转入累计损耗，
+  盘盈只回冲此前盘点确认的损耗（不增初始登记量、不动已用量与预留），
+  库存变动与盘点前后快照在同一事务原子封存，可按批次查询盘点历史。
 
 - 体积一律使用**整数纳升（nL）**；
 - 浓度一律使用**有理数**（`fractions.Fraction`，输入如 `"2/3"`、`"0.25"`、`"40"`）；
@@ -47,9 +51,11 @@ docker compose up --build
 2. 在应用镜像内 `pip install -r requirements.txt`；
 3. 应用启动时自动连接数据库并执行 `CREATE TABLE IF NOT EXISTS ...` 建表
    （`plans`、`batches`、`reservations`、`reservation_items`、
-   `step_registrations`、`recalls`、`execution_reviews`；
-   对既有库用 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` 补齐批次召回列与
-   逐步执行列、幂等放宽 `reservations.status` 约束，无需手工迁移）。
+   `step_registrations`、`recalls`、`execution_reviews`、`stocktakes`；
+   对既有库用 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` 补齐批次召回列、
+   逐步执行列与批次累计损耗列 `lost_nl`（含新的体积平衡约束
+   `reserved_nl + used_nl + lost_nl <= initial_nl`），
+   幂等放宽 `reservations.status` 约束，无需手工迁移）。
 
 服务地址与端口：
 
@@ -135,7 +141,9 @@ docker compose up --build
 - `409 Conflict`：同 ID 但浓度或初始体积不同（`error: "batch_conflict"`）；
 - `400 Bad Request`：非法数值/类型。
 
-批次的可用量恒为 `available_nl = initial_volume_nl - reserved_nl - used_nl`。
+批次的可用量恒为
+`available_nl = initial_volume_nl - reserved_nl - used_nl - lost_nl`
+（`lost_nl` 为盘点确认的累计损耗，见下文“库存盘点”）。
 
 ### `GET /batches` / `GET /batches/{batch_id}`
 
@@ -331,6 +339,63 @@ docker compose up --build
 `GET /batches` 与 `GET /batches/{id}` 的批次对象另附实时召回字段
 `recalled` / `recalled_reason` / `recalled_at`。
 
+### 库存盘点（`POST /batches/{batch_id}/stocktakes`）
+
+实验员按**批次号 + 唯一盘点单号 + 实测可用体积**（整数 nL）核对库存。
+请求头 `X-Stocktake-ID`（**必填**，1–64 字符、不得以 `@` 开头）为盘点单号，
+请求体只有一个字段：
+
+```json
+{"counted_available_nl": 998000}
+```
+
+`counted_available_nl` 是**实测的未预留可用体积**（≥0 的整数）。系统把它与
+锁定后的账面可用量比对，差额即盘亏/盘盈：
+
+- **盘亏**（实测 < 账面）：差额只从**未预留的可用量**转入**累计损耗**
+  （批次 `lost_nl` 增加、`available_nl` 等额减少）；初始登记量、已用量与
+  现有预留一律不动；
+- **盘盈**（实测 > 账面）：只能**回冲该批次此前盘点确认的损耗**
+  （`lost_nl` 等额减少），不能增加初始登记量，也不能改动已用量或现有预留；
+  盘盈超过可回冲损耗（即实测 > `初始 − 预留 − 已用`）整单拒绝；
+- **账实相符**：差额为 0，不改库存，仍封存一条 `balanced` 盘点记录。
+
+**并发与原子性**：盘点事务先查已封存记录，再对批次行
+`SELECT ... FOR UPDATE`（与计划创建、确认/取消、逐步登记/中止、召回
+完全相同的“先批次行”加锁点），在**同一把锁后的库存状态**上判定差额、
+移动 `lost_nl` 并把**盘点前后快照**（`before` / `after`，各含
+`initial_volume_nl` / `reserved_nl` / `used_nl` / `lost_nl` /
+`available_nl`）与库存变动在**同一个事务**里原子封存；并发盘点按批次行锁
+串行化，同单号并发由 `ON CONFLICT DO NOTHING` + 封后复读裁决（恰好一方
+`201`，其余按内容回放或冲突）。
+
+**响应：**
+
+- `201 Created`：新盘点封存。体含 `stocktake_id`、`batch_id`、
+  `counted_available_nl`、`kind`（`loss` / `gain` / `balanced`）、
+  `delta_nl`（实测 − 账面可用，带符号）、`loss_applied_nl` /
+  `gain_applied_nl`（本次计入/回冲的损耗）、`before` / `after` 快照与
+  `recorded_at`；
+- `200 OK`：**同盘点单号 + 同内容**重试，原样返回首次封存记录
+  （库存不重复入账；即使批次后来被召回或再次盘点，回放仍不变）；
+- `409 Conflict`：
+  - `stocktake_conflict`：同盘点单号已封存**不同内容**（附
+    `existing_batch_id`）；
+  - `batch_recalled`：批次已召回，不再接受新盘点（附召回原因与时间）；
+  - `uncoverable_surplus`：盘盈超过可回冲损耗（附 `available_nl`、
+    `recoverable_loss_nl`、`max_counted_nl`）；
+- `404 Not Found`：`unknown_batch`（批次未登记）；
+- `400 Bad Request`：实测体积为负/缺失、盘点单号缺失/空白/非法。
+
+**所有拒绝都不改库存、不封存记录**，盘点单号不被占用，修正后可复用。
+
+### `GET /batches/{batch_id}/stocktakes` / `GET /stocktakes/{stocktake_id}`
+
+按批次查询盘点历史（按封存时间升序，返回完整封存记录列表；
+批次未登记 `404 unknown_batch`，无盘点记录时为空列表），或按盘点单号
+取回单条封存记录（不存在 `404 not_found`）。`GET /batches` 与
+`GET /batches/{id}` 的批次对象另附实时 `lost_nl` 字段。
+
 ### 执行差异复核（已完成 / 已中止的逐步计划）
 
 对**已经结束的库存逐步计划**（`completed` / `aborted`），可提交一份
@@ -483,6 +548,15 @@ bash examples/review.sh
 python3 examples/review_demo.py
 ```
 
+库存盘点完整流程（登记批次并预留 → 盘亏转入累计损耗、盘盈回冲损耗 →
+同单同内容回放/同单异内容冲突 → 超额盘盈/负值/未知批次/已召回批次明确拒绝
+且不改库存 → 按批次查询盘点历史）：
+
+```bash
+bash examples/stocktake.sh
+python3 examples/stocktake_demo.py
+```
+
 示例（1000 浓度母液，移液器 500–1000nL、步进 100nL，目标 A1=400、A2=100）会生成
 两个中间液（如 400 与 100），并把较大的批量安排进较大的容器，所有转移均为 500–1000nL。
 
@@ -511,14 +585,18 @@ python3 -m pytest tests/     # 完整测试（含库存模式与并发用例）
 ```
 app/
   main.py          FastAPI 路由与状态码（/plans、/batches、/inventory/plans、
-                   确认/取消、逐步登记/结案/中止、批次召回、执行差异复核）
-  models.py        Pydantic 请求/响应模型与浓度校验（含逐步登记与复核请求）
+                   确认/取消、逐步登记/结案/中止、批次召回、执行差异复核、
+                   库存盘点）
+  models.py        Pydantic 请求/响应模型与浓度校验（含逐步登记、复核与
+                   盘点请求）
   planning.py      请求 -> 求解器映射、引用校验、幂等哈希、批次用量统计、
                    逐步进度与已用/待取统计、召回影响孔追踪（沿转移穿过中间液、
-                   逐步计划按已执行步骤前缀追踪）、执行差异逐步比对与复核哈希
+                   逐步计划按已执行步骤前缀追踪）、执行差异逐步比对与复核哈希、
+                   盘点内容哈希
   db.py            asyncpg 连接池、建表、冻结/取回、批次登记、原子预留、
                    确认/取消、逐步登记/结案/中止、不可撤销召回、
-                   不可变执行复核封存/取回（单事务 + 行锁裁决）
+                   不可变执行复核封存/取回、库存盘点入账与封存/历史查询
+                   （单事务 + 行锁裁决）
   solver/
     core.py        数据结构、移液器可行性、最小批量
     options.py     候选方案（直接/双源/新中间液/逐级稀释链）
@@ -527,12 +605,13 @@ app/
 examples/          request.json、inventory.json、inventory_stepwise.json、
                    curl.sh、inventory.sh、call_api.py、inventory_demo.py、
                    recall.sh、recall_demo.py、stepwise.sh、stepwise_demo.py、
-                   review.sh、review_demo.py
+                   review.sh、review_demo.py、stocktake.sh、stocktake_demo.py
 tests/             smoke.py（求解器）、api_smoke.py（HTTP+幂等）、
                    test_api.py、test_solver.py、test_inventory.py（库存/并发）、
                    test_recall.py（召回/追踪/并发裁决）、
                    test_stepwise.py（逐步登记/结案/中止/召回并发）、
-                   test_reviews.py（执行差异复核/幂等/冲突/只读）
+                   test_reviews.py（执行差异复核/幂等/冲突/只读）、
+                   test_stocktake.py（盘点入账/幂等/拒绝/历史/并发）
 Dockerfile, docker-compose.yml, requirements.txt
 ```
 
@@ -580,19 +659,6 @@ Dockerfile, docker-compose.yml, requirements.txt
    启动方式与健康检查保持可用。
 6. **用法补充**：新增 `examples/recall.sh`、`examples/recall_demo.py` 调用示例，
    测试新增 `tests/test_recall.py`（含召回/创建、召回/确认并发用例）。
-
-1. **新增批次登记与库存模式**：`POST/GET /batches`、`POST /inventory/plans`、
-   `POST /inventory/plans/{id}/confirm|cancel`、`GET /inventory/plans/{id}`；
-   新增 `batches`、`reservations`、`reservation_items` 三张表（启动时自动创建）。
-2. **原子预留**：可行计划的冻结与各批次 `reserved_nl` 增加在同一事务提交；
-   批次行 `FOR UPDATE` 加锁，并发不超卖；失败（非法批次/无解/库存不足）不占库存。
-3. **预留生命周期**：`reserved → confirmed`（计入 `used_nl`，不可再取消）或
-   `reserved → cancelled`（归还一次）；重复/并发操作幂等收敛。
-4. **数据库连接改为连接池**（`asyncpg.create_pool`），`/health`、`/plans` 行为不变。
-5. **兼容性**：`/plans` 请求格式、`X-Request-ID` 幂等、状态码与冻结语义完全不变；
-   库存模式复用同一冻结机制（同号同体 `200` 原结果、同号异体 `409`）。
-6. **修复**：请求校验异常处理器现在对字段校验器抛出的 `ValueError`
-   （如 `@` 前缀 ID）也能正确返回 `400`（此前会因错误对象无法 JSON 序列化而 500）。
 
 ---
 
@@ -666,3 +732,42 @@ Dockerfile, docker-compose.yml, requirements.txt
    （仅标准库）；新增 `tests/test_reviews.py`（完美匹配/中止缺失/体积与来源
    不一致/多余步骤、同号回放与异内容冲突、四类整批拒绝不留报告、资格校验、
    复核只读、两种 GET 取回路径），比对核心为 `planning.py` 中的纯函数。
+
+---
+
+## 11. 本轮变动（库存盘点）
+
+1. **新增库存盘点**：`POST /batches/{id}/stocktakes`（批次号在路径、唯一
+   盘点单号在 `X-Stocktake-ID` 头、实测可用体积在体）与
+   `GET /batches/{id}/stocktakes`（按批次查询盘点历史）、
+   `GET /stocktakes/{stocktake_id}`（按单号取回单条封存记录）。
+   新增 `stocktakes` 表与 `batches.lost_nl` 累计损耗列（启动时
+   `CREATE TABLE IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS` 自动迁移，
+   并新增体积平衡约束 `reserved_nl + used_nl + lost_nl <= initial_nl`）。
+2. **盘亏/盘盈入账**：盘亏只从未预留的可用量转入累计损耗
+   （`lost_nl` 增加、可用量等额减少）；盘盈只回冲该批次此前盘点确认的
+   损耗（`lost_nl` 减少，至多归零），**不增加初始登记量、不改已用量与
+   现有预留**；账实相符封存 `balanced` 记录、不动库存。批次可用量口径
+   变为 `available_nl = initial − reserved − used − lost`，后续计划的
+   可预留量随之收缩。
+3. **原子封存与并发裁决**：盘点事务先查已封存记录，再对批次行
+   `SELECT ... FOR UPDATE`（与计划创建、确认/取消、逐步登记/中止、召回
+   相同的“先批次行”加锁点），在同一锁定后的库存状态上判定差额；
+   `lost_nl` 变动与盘点前后快照（`before`/`after` 五项库存数字）在同一
+   事务原子提交。同批次并发盘点按行锁串行化、快照首尾相接；同单号并发
+   由 `ON CONFLICT DO NOTHING` + 封后复读裁决，恰好一方 `201`。
+4. **幂等与冲突**：同盘点单号 + 同内容重试原样返回首次封存记录
+   （`200`，库存不重复入账，即使批次后来已召回）；同单号异内容
+   `409 stocktake_conflict`。
+5. **明确拒绝且不改库存**：已召回批次 `409 batch_recalled`、未知批次
+   `404 unknown_batch`、负值/非法输入 `400`、盘盈超过可回冲损耗
+   `409 uncoverable_surplus`（附 `recoverable_loss_nl` 与
+   `max_counted_nl`）；所有拒绝都不改库存、不封存记录，盘点单号可复用。
+6. **兼容性**：既有计划、批次、预留、逐步、召回、复核接口语义完全不变；
+   批次对象仅**新增** `lost_nl` 字段；无新增配置项，
+   `docker compose up` 启动方式与健康检查保持可用；版本号升至 `1.5.0`。
+7. **用法与测试**：新增 `examples/stocktake.sh`、
+   `examples/stocktake_demo.py`（仅标准库）；新增
+   `tests/test_stocktake.py`（盘亏/盘盈/账平入账、预留与已用不受盘点影响、
+   同单回放与异单冲突、四类拒绝不改库存不占用单号、按批次历史查询、
+   盘点与计划创建/确认/同单号并发用例）。

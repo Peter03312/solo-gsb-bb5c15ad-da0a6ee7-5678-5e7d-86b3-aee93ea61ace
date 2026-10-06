@@ -516,3 +516,21 @@ def review_content_hash(request_id: str, transfers: list[dict]) -> str:
     blob = json.dumps(payload, sort_keys=True,
                       separators=(",", ":")).encode()
     return hashlib.sha256(blob).hexdigest()
+
+
+# --------------------------------------------------------------------------- #
+# Physical stocktakes
+# --------------------------------------------------------------------------- #
+
+
+def stocktake_content_hash(batch_id: str, counted_nl: int) -> str:
+    """Stable hash of a stocktake submission (batch id + counted volume).
+
+    Same stocktake id + same content replays the original sealed record;
+    same stocktake id with different content is a conflict.
+    """
+    payload = {"batch_id": batch_id,
+               "counted_available_nl": counted_nl}
+    blob = json.dumps(payload, sort_keys=True,
+                      separators=(",", ":")).encode()
+    return hashlib.sha256(blob).hexdigest()

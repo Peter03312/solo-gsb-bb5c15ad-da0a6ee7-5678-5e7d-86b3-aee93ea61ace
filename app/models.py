@@ -205,6 +205,17 @@ class RecallIn(BaseModel):
         return v
 
 
+class StocktakeIn(BaseModel):
+    """Physical count of a batch's unreserved available volume (nL).
+
+    A count below the system available volume books the difference as a
+    confirmed loss (moved into the batch's cumulative ``lost_nl``); a count
+    above it reverses previously confirmed losses only -- it can never raise
+    the initial registration, nor change used volume or reservations.
+    """
+    counted_available_nl: int = Field(ge=0)
+
+
 # --------------------------------------------------------------------------- #
 # Stepwise execution
 # --------------------------------------------------------------------------- #

@@ -51,6 +51,16 @@ ALTER TABLE batches ADD COLUMN IF NOT EXISTS recalled
 ALTER TABLE batches ADD COLUMN IF NOT EXISTS recalled_reason TEXT;
 ALTER TABLE batches ADD COLUMN IF NOT EXISTS recalled_at TIMESTAMPTZ;
 
+-- Cumulative stocktake-confirmed loss. Physical stocktakes move unreserved
+-- available volume into lost_nl (shortage) or reverse previously confirmed
+-- losses (surplus); initial registration, used volume and reservations are
+-- never touched by a stocktake.
+ALTER TABLE batches ADD COLUMN IF NOT EXISTS lost_nl
+    BIGINT NOT NULL DEFAULT 0 CHECK (lost_nl >= 0);
+ALTER TABLE batches DROP CONSTRAINT IF EXISTS batches_volume_balance_check;
+ALTER TABLE batches ADD CONSTRAINT batches_volume_balance_check
+    CHECK (reserved_nl + used_nl + lost_nl <= initial_nl);
+
 CREATE TABLE IF NOT EXISTS reservations (
     request_id      TEXT PRIMARY KEY,
     status          TEXT NOT NULL,
@@ -113,6 +123,21 @@ CREATE TABLE IF NOT EXISTS execution_reviews (
     report          JSONB NOT NULL,
     sealed_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Physical stocktake records. A row is sealed once, in the same transaction
+-- as the inventory movement it justifies, and never updated afterwards: the
+-- frozen before/after snapshots are returned verbatim on every later GET /
+-- same-content retry; same stocktake id + different content is rejected as a
+-- conflict. Rejected stocktakes (recalled batch, uncoverable surplus, ...)
+-- insert no row and change no balance.
+CREATE TABLE IF NOT EXISTS stocktakes (
+    stocktake_id    TEXT PRIMARY KEY,
+    batch_id        TEXT NOT NULL REFERENCES batches(batch_id),
+    content_hash    TEXT NOT NULL,
+    counted_nl      BIGINT NOT NULL CHECK (counted_nl >= 0),
+    result          JSONB NOT NULL,
+    recorded_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 
@@ -173,7 +198,8 @@ async def freeze(pool, request_id: str, request_hash: str,
 
 
 def _batch_dict(row) -> dict:
-    available = row["initial_nl"] - row["reserved_nl"] - row["used_nl"]
+    available = (row["initial_nl"] - row["reserved_nl"] - row["used_nl"]
+                 - row["lost_nl"])
     recalled_at = row["recalled_at"]
     return {
         "id": row["batch_id"],
@@ -181,6 +207,7 @@ def _batch_dict(row) -> dict:
         "initial_volume_nl": row["initial_nl"],
         "reserved_nl": row["reserved_nl"],
         "used_nl": row["used_nl"],
+        "lost_nl": row["lost_nl"],
         "available_nl": available,
         "recalled": row["recalled"],
         "recalled_reason": row["recalled_reason"],
@@ -189,7 +216,7 @@ def _batch_dict(row) -> dict:
 
 
 _BATCH_COLS = ("batch_id, concentration, initial_nl, reserved_nl, used_nl, "
-               "recalled, recalled_reason, recalled_at")
+               "lost_nl, recalled, recalled_reason, recalled_at")
 
 
 async def create_batch(pool, batch_id: str, concentration: str,
@@ -307,7 +334,8 @@ async def reserve_and_freeze(pool, request_id: str, request_hash: str,
                 ids = sorted(usage)
                 rows = await conn.fetch(
                     """
-                    SELECT batch_id, initial_nl, reserved_nl, used_nl, recalled
+                    SELECT batch_id, initial_nl, reserved_nl, used_nl,
+                           lost_nl, recalled
                     FROM batches
                     WHERE batch_id = ANY($1::text[])
                     ORDER BY batch_id
@@ -328,7 +356,7 @@ async def reserve_and_freeze(pool, request_id: str, request_hash: str,
                 for bid in ids:
                     r = found[bid]
                     available = (r["initial_nl"] - r["reserved_nl"]
-                                 - r["used_nl"])
+                                 - r["used_nl"] - r["lost_nl"])
                     if available < usage[bid]:
                         shortages.append({
                             "batch_id": bid,
@@ -1086,3 +1114,191 @@ async def get_execution_review(pool, review_id: str):
             review_id,
         )
     return json.loads(row["report"]) if row is not None else None
+
+
+# --------------------------------------------------------------------------- #
+# Physical stocktakes (inventory counts)
+# --------------------------------------------------------------------------- #
+
+
+def _stock_snapshot(row) -> dict:
+    """The five inventory figures a stocktake seals before/after itself."""
+    available = (row["initial_nl"] - row["reserved_nl"] - row["used_nl"]
+                 - row["lost_nl"])
+    return {
+        "initial_volume_nl": row["initial_nl"],
+        "reserved_nl": row["reserved_nl"],
+        "used_nl": row["used_nl"],
+        "lost_nl": row["lost_nl"],
+        "available_nl": available,
+    }
+
+
+async def record_stocktake(pool, stocktake_id: str, batch_id: str,
+                           counted_nl: int, content_hash: str):
+    """Seal a physical stocktake against the authoritative batch state.
+
+    Everything happens in one transaction:
+
+    1. an already-sealed ``stocktake_id`` decides replay (same content) or
+       conflict (different content) *before* any inventory state is
+       consulted -- a sealed stocktake replays verbatim even if the batch
+       was later recalled or re-counted;
+    2. the batch row is locked ``FOR UPDATE`` -- the same row every
+       inventory mutation (reserve / confirm / cancel / step registration /
+       abort / recall) locks first -- so the count is adjudicated against
+       the same locked state those operations serialize on;
+    3. a recalled batch, or a surplus larger than the cumulative confirmed
+       loss it could reverse, rejects the whole stocktake: no inventory
+       changes, nothing is sealed, and the stocktake id stays reusable;
+    4. otherwise the shortage (counted below the unreserved available
+       volume) moves into ``lost_nl`` -- or the surplus reverses previously
+       confirmed loss -- and the before/after snapshots are sealed together
+       with that movement in the same commit.
+
+    Returns ``(outcome, data)``:
+
+    * ``("ok", doc)``          - stocktake sealed; inventory updated (201);
+    * ``("replay", doc)``      - same id + same content; the original sealed
+                                 document, balances untouched (200);
+    * ``("conflict", data)``   - the id is already sealed with different
+                                 content (409);
+    * ``("unknown", None)``    - no such batch (404);
+    * ``("recalled", data)``   - the batch is recalled (409);
+    * ``("uncoverable", data)``- the surplus exceeds the recoverable loss
+                                 (409); nothing was changed or sealed.
+    """
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                existing = await conn.fetchrow(
+                    "SELECT batch_id, content_hash, result FROM stocktakes "
+                    "WHERE stocktake_id = $1",
+                    stocktake_id,
+                )
+                if existing is not None:
+                    if existing["content_hash"] == content_hash:
+                        return "replay", json.loads(existing["result"])
+                    return "conflict", {
+                        "stocktake_id": stocktake_id,
+                        "existing_batch_id": existing["batch_id"],
+                    }
+                row = await conn.fetchrow(
+                    f"SELECT {_BATCH_COLS} FROM batches WHERE batch_id = $1 "
+                    "FOR UPDATE",
+                    batch_id,
+                )
+                if row is None:
+                    return "unknown", None
+                if row["recalled"]:
+                    return "recalled", {
+                        "batch_id": batch_id,
+                        "recalled_reason": row["recalled_reason"],
+                        "recalled_at": (row["recalled_at"].isoformat()
+                                        if row["recalled_at"] else None),
+                    }
+                before = _stock_snapshot(row)
+                available = before["available_nl"]
+                delta = counted_nl - available
+                if delta > before["lost_nl"]:
+                    # A surplus may only reverse previously confirmed losses:
+                    # counted volume above initial - reserved - used has no
+                    # physical source and is rejected out of hand.
+                    return "uncoverable", {
+                        "batch_id": batch_id,
+                        "counted_available_nl": counted_nl,
+                        "available_nl": available,
+                        "recoverable_loss_nl": before["lost_nl"],
+                        "max_counted_nl": available + before["lost_nl"],
+                    }
+                new_lost = before["lost_nl"] - delta
+                if delta != 0:
+                    await conn.execute(
+                        "UPDATE batches SET lost_nl = $2 WHERE batch_id = $1",
+                        batch_id, new_lost,
+                    )
+                after = dict(before)
+                after["lost_nl"] = new_lost
+                after["available_nl"] = available + delta
+                doc = {
+                    "stocktake_id": stocktake_id,
+                    "batch_id": batch_id,
+                    "counted_available_nl": counted_nl,
+                    "kind": ("loss" if delta < 0
+                             else "gain" if delta > 0 else "balanced"),
+                    "delta_nl": delta,
+                    "loss_applied_nl": -delta if delta < 0 else 0,
+                    "gain_applied_nl": delta if delta > 0 else 0,
+                    "before": before,
+                    "after": after,
+                }
+                inserted = await conn.fetchrow(
+                    """
+                    INSERT INTO stocktakes (stocktake_id, batch_id,
+                                            content_hash, counted_nl, result)
+                    VALUES ($1, $2, $3, $4, $5::jsonb)
+                    ON CONFLICT (stocktake_id) DO NOTHING
+                    RETURNING recorded_at
+                    """,
+                    stocktake_id, batch_id, content_hash, counted_nl,
+                    json.dumps(doc),
+                )
+                if inserted is None:
+                    # A concurrent stocktake sealed the same id first (only
+                    # possible across different batches: same-batch counts
+                    # serialize on the batch row lock). Roll this inventory
+                    # movement back and replay/conflict the winner below.
+                    raise _Abort("race", None)
+                doc["recorded_at"] = inserted["recorded_at"].isoformat()
+                # Persist the complete sealed document (timestamp included)
+                # so every replay is byte-for-byte identical.
+                await conn.execute(
+                    "UPDATE stocktakes SET result = $2::jsonb "
+                    "WHERE stocktake_id = $1",
+                    stocktake_id, json.dumps(doc),
+                )
+                return "ok", doc
+    except _Abort as abort:
+        if abort.outcome != "race":
+            raise
+    # The loser of the insert race re-reads the winner's sealed document in a
+    # fresh transaction; its own inventory movement was rolled back.
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT batch_id, content_hash, result FROM stocktakes "
+            "WHERE stocktake_id = $1",
+            stocktake_id,
+        )
+    if row["content_hash"] == content_hash:
+        return "replay", json.loads(row["result"])
+    return "conflict", {"stocktake_id": stocktake_id,
+                        "existing_batch_id": row["batch_id"]}
+
+
+async def get_stocktake(pool, stocktake_id: str):
+    """Return the sealed stocktake document, or ``None`` if no such record."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT result FROM stocktakes WHERE stocktake_id = $1",
+            stocktake_id,
+        )
+    return json.loads(row["result"]) if row is not None else None
+
+
+async def list_stocktakes(pool, batch_id: str):
+    """Sealed stocktakes of one batch in recording order.
+
+    Returns ``"missing"`` when no such batch exists, otherwise the (possibly
+    empty) list of sealed stocktake documents.
+    """
+    async with pool.acquire() as conn:
+        exists = await conn.fetchval(
+            "SELECT TRUE FROM batches WHERE batch_id = $1", batch_id)
+        if not exists:
+            return "missing"
+        rows = await conn.fetch(
+            "SELECT result FROM stocktakes WHERE batch_id = $1 "
+            "ORDER BY recorded_at, stocktake_id",
+            batch_id,
+        )
+    return [json.loads(r["result"]) for r in rows]
