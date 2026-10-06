@@ -39,17 +39,33 @@ CREATE TABLE IF NOT EXISTS batches (
     initial_nl      BIGINT NOT NULL CHECK (initial_nl > 0),
     reserved_nl     BIGINT NOT NULL DEFAULT 0 CHECK (reserved_nl >= 0),
     used_nl         BIGINT NOT NULL DEFAULT 0 CHECK (used_nl >= 0),
+    loss_nl         BIGINT NOT NULL DEFAULT 0 CHECK (loss_nl >= 0),
     recalled        BOOLEAN NOT NULL DEFAULT FALSE,
     recalled_reason TEXT,
     recalled_at     TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CHECK (reserved_nl + used_nl <= initial_nl)
+    CONSTRAINT batches_balance_check
+        CHECK (reserved_nl + used_nl + loss_nl <= initial_nl)
 );
 
 ALTER TABLE batches ADD COLUMN IF NOT EXISTS recalled
     BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE batches ADD COLUMN IF NOT EXISTS recalled_reason TEXT;
 ALTER TABLE batches ADD COLUMN IF NOT EXISTS recalled_at TIMESTAMPTZ;
+
+-- Migrate batches registered before stocktaking: cumulative stocktake
+-- losses live in loss_nl and count against the usable balance.
+ALTER TABLE batches ADD COLUMN IF NOT EXISTS loss_nl
+    BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE batches DROP CONSTRAINT IF EXISTS batches_loss_nl_check;
+ALTER TABLE batches ADD CONSTRAINT batches_loss_nl_check
+    CHECK (loss_nl >= 0);
+-- The pre-stocktake balance constraint (auto-named batches_check) did not
+-- know about losses; replace it with the loss-aware one.
+ALTER TABLE batches DROP CONSTRAINT IF EXISTS batches_check;
+ALTER TABLE batches DROP CONSTRAINT IF EXISTS batches_balance_check;
+ALTER TABLE batches ADD CONSTRAINT batches_balance_check
+    CHECK (reserved_nl + used_nl + loss_nl <= initial_nl);
 
 CREATE TABLE IF NOT EXISTS reservations (
     request_id      TEXT PRIMARY KEY,
@@ -113,6 +129,21 @@ CREATE TABLE IF NOT EXISTS execution_reviews (
     report          JSONB NOT NULL,
     sealed_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Physical stocktake counts. Each row is sealed atomically together with
+-- the loss adjustment it adjudicated (same transaction, batch row locked
+-- FOR UPDATE) and is never updated or deleted: a same-content retry of the
+-- same stocktake id replays the sealed record, a different content
+-- conflicts. ``record`` holds the complete sealed document (measured and
+-- expected volumes, kind, loss delta and the before/after snapshots).
+CREATE TABLE IF NOT EXISTS stocktakes (
+    stocktake_id    TEXT PRIMARY KEY,
+    batch_id        TEXT NOT NULL REFERENCES batches(batch_id),
+    content_hash    TEXT NOT NULL,
+    record          JSONB NOT NULL,
+    counted_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    seq             BIGSERIAL UNIQUE
+);
 """
 
 
@@ -173,7 +204,8 @@ async def freeze(pool, request_id: str, request_hash: str,
 
 
 def _batch_dict(row) -> dict:
-    available = row["initial_nl"] - row["reserved_nl"] - row["used_nl"]
+    available = (row["initial_nl"] - row["reserved_nl"] - row["used_nl"]
+                 - row["loss_nl"])
     recalled_at = row["recalled_at"]
     return {
         "id": row["batch_id"],
@@ -181,6 +213,7 @@ def _batch_dict(row) -> dict:
         "initial_volume_nl": row["initial_nl"],
         "reserved_nl": row["reserved_nl"],
         "used_nl": row["used_nl"],
+        "loss_nl": row["loss_nl"],
         "available_nl": available,
         "recalled": row["recalled"],
         "recalled_reason": row["recalled_reason"],
@@ -189,7 +222,7 @@ def _batch_dict(row) -> dict:
 
 
 _BATCH_COLS = ("batch_id, concentration, initial_nl, reserved_nl, used_nl, "
-               "recalled, recalled_reason, recalled_at")
+               "loss_nl, recalled, recalled_reason, recalled_at")
 
 
 async def create_batch(pool, batch_id: str, concentration: str,
@@ -307,7 +340,8 @@ async def reserve_and_freeze(pool, request_id: str, request_hash: str,
                 ids = sorted(usage)
                 rows = await conn.fetch(
                     """
-                    SELECT batch_id, initial_nl, reserved_nl, used_nl, recalled
+                    SELECT batch_id, initial_nl, reserved_nl, used_nl,
+                           loss_nl, recalled
                     FROM batches
                     WHERE batch_id = ANY($1::text[])
                     ORDER BY batch_id
@@ -328,7 +362,7 @@ async def reserve_and_freeze(pool, request_id: str, request_hash: str,
                 for bid in ids:
                     r = found[bid]
                     available = (r["initial_nl"] - r["reserved_nl"]
-                                 - r["used_nl"])
+                                 - r["used_nl"] - r["loss_nl"])
                     if available < usage[bid]:
                         shortages.append({
                             "batch_id": bid,
@@ -1086,3 +1120,193 @@ async def get_execution_review(pool, review_id: str):
             review_id,
         )
     return json.loads(row["report"]) if row is not None else None
+
+
+# --------------------------------------------------------------------------- #
+# Physical stocktakes (inventory counts)
+# --------------------------------------------------------------------------- #
+
+
+async def record_stocktake(pool, stocktake_id: str, batch_id: str,
+                           measured_nl: int, content_hash: str):
+    """Adjudicate one physical count and seal it atomically with its effect.
+
+    Everything is settled against the batch row locked ``FOR UPDATE`` -- the
+    same lock plan creation, confirm/cancel, stepwise registration and
+    recalls take first -- so a stocktake is always adjudicated on the
+    authoritative inventory state, and the balance change (if any) commits
+    in the same transaction as the sealed before/after snapshot:
+
+    * **deficit** (measured < book available): the missing volume moves from
+      the unreserved available pool into the cumulative ``loss_nl``;
+    * **surplus** (measured > book available): only previously confirmed
+      losses may be offset -- ``loss_nl`` is reduced by at most its current
+      value; initial volume, used volume and reservations never change;
+    * **balanced**: no balance movement; the count is still sealed.
+
+    Returns ``(outcome, detail)``:
+
+    * ``("ok", record)``              - sealed by this call;
+    * ``("replay", record)``          - same order id + same content; the
+                                        original sealed record, unchanged;
+    * ``("conflict", {...})``         - same order id, different content;
+    * ``("unknown", None)``           - no such batch;
+    * ``("recalled", {...})``         - the batch has been recalled;
+    * ``("surplus_exceeded", {...})`` - the surplus exceeds the offsettable
+                                        cumulative loss.
+
+    Every rejection leaves the inventory untouched.
+    """
+    # Fast path: sealed records are immutable, so an existing order id
+    # answers replay/conflict without touching the batch row at all.
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            "SELECT content_hash, record FROM stocktakes "
+            "WHERE stocktake_id = $1",
+            stocktake_id,
+        )
+    if existing is not None:
+        record = json.loads(existing["record"])
+        if existing["content_hash"] == content_hash:
+            return "replay", record
+        return "conflict", {"stocktake_id": stocktake_id,
+                            "existing_batch_id": record.get("batch_id")}
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    f"SELECT {_BATCH_COLS} FROM batches "
+                    "WHERE batch_id = $1 FOR UPDATE",
+                    batch_id,
+                )
+                if row is None:
+                    return "unknown", None
+                # Authoritative re-check under the batch row lock: a
+                # concurrent same-id stocktake that committed first is
+                # replayed/conflicted here, before any balance change.
+                dup = await conn.fetchrow(
+                    "SELECT content_hash, record FROM stocktakes "
+                    "WHERE stocktake_id = $1",
+                    stocktake_id,
+                )
+                if dup is not None:
+                    record = json.loads(dup["record"])
+                    if dup["content_hash"] == content_hash:
+                        raise _Abort("replay", record)
+                    raise _Abort("conflict", {
+                        "stocktake_id": stocktake_id,
+                        "existing_batch_id": record.get("batch_id")})
+                if row["recalled"]:
+                    return "recalled", {
+                        "batch_id": batch_id,
+                        "recalled_reason": row["recalled_reason"],
+                        "recalled_at": (row["recalled_at"].isoformat()
+                                        if row["recalled_at"] else None),
+                    }
+                initial = row["initial_nl"]
+                reserved = row["reserved_nl"]
+                used = row["used_nl"]
+                loss = row["loss_nl"]
+                expected = initial - reserved - used - loss
+                diff = measured_nl - expected
+                if diff > loss:
+                    # A surplus may only offset losses confirmed by earlier
+                    # stocktakes; it can never grow the initial registration,
+                    # touch used volume or existing reservations.
+                    return "surplus_exceeded", {
+                        "batch_id": batch_id,
+                        "measured_available_nl": measured_nl,
+                        "expected_available_nl": expected,
+                        "surplus_nl": diff,
+                        "offsettable_loss_nl": loss,
+                    }
+                new_loss = loss - diff
+                if new_loss != loss:
+                    await conn.execute(
+                        "UPDATE batches SET loss_nl = $2 WHERE batch_id = $1",
+                        batch_id, new_loss,
+                    )
+                counted_at = await conn.fetchval("SELECT now()")
+                record = {
+                    "stocktake_id": stocktake_id,
+                    "batch_id": batch_id,
+                    "measured_available_nl": measured_nl,
+                    "expected_available_nl": expected,
+                    "kind": ("balanced" if diff == 0
+                             else "deficit" if diff < 0 else "surplus"),
+                    "loss_delta_nl": new_loss - loss,
+                    "before": {
+                        "initial_volume_nl": initial,
+                        "reserved_nl": reserved,
+                        "used_nl": used,
+                        "loss_nl": loss,
+                        "available_nl": expected,
+                    },
+                    "after": {
+                        "initial_volume_nl": initial,
+                        "reserved_nl": reserved,
+                        "used_nl": used,
+                        "loss_nl": new_loss,
+                        "available_nl": initial - reserved - used - new_loss,
+                    },
+                    "counted_at": counted_at.isoformat(),
+                }
+                inserted = await conn.fetchrow(
+                    """
+                    INSERT INTO stocktakes
+                        (stocktake_id, batch_id, content_hash, record,
+                         counted_at)
+                    VALUES ($1, $2, $3, $4::jsonb, $5)
+                    ON CONFLICT (stocktake_id) DO NOTHING
+                    RETURNING seq
+                    """,
+                    stocktake_id, batch_id, content_hash,
+                    json.dumps(record), counted_at,
+                )
+                if inserted is None:
+                    # The same order id committed concurrently (necessarily
+                    # against another batch, since same-batch stocktakes
+                    # serialize on the batch row lock). Roll this transaction
+                    # -- including its loss update -- back and adjudicate on
+                    # the winner's sealed record.
+                    winner = await conn.fetchrow(
+                        "SELECT content_hash, record FROM stocktakes "
+                        "WHERE stocktake_id = $1",
+                        stocktake_id,
+                    )
+                    wrec = json.loads(winner["record"])
+                    if winner["content_hash"] == content_hash:
+                        raise _Abort("replay", wrec)
+                    raise _Abort("conflict", {
+                        "stocktake_id": stocktake_id,
+                        "existing_batch_id": wrec.get("batch_id")})
+                return "ok", record
+    except _Abort as abort:
+        return abort.outcome, abort.detail
+
+
+async def get_stocktake(pool, stocktake_id: str):
+    """Return the sealed stocktake record, or ``None`` if no such order."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT record FROM stocktakes WHERE stocktake_id = $1",
+            stocktake_id,
+        )
+    return json.loads(row["record"]) if row is not None else None
+
+
+async def list_stocktakes(pool, batch_id: str):
+    """Sealed stocktake records of a batch, oldest first.
+
+    Returns ``None`` when no such batch exists (the caller answers 404).
+    """
+    async with pool.acquire() as conn:
+        exists = await conn.fetchval(
+            "SELECT TRUE FROM batches WHERE batch_id = $1", batch_id)
+        if not exists:
+            return None
+        rows = await conn.fetch(
+            "SELECT record FROM stocktakes WHERE batch_id = $1 ORDER BY seq",
+            batch_id,
+        )
+    return [json.loads(r["record"]) for r in rows]

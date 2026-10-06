@@ -41,14 +41,16 @@ class FakeStore:
 
     @staticmethod
     def _pub(b):
+        loss = b.get("loss_nl", 0)
         return {
             "id": b["id"],
             "concentration": b["concentration"],
             "initial_volume_nl": b["initial_volume_nl"],
             "reserved_nl": b["reserved_nl"],
             "used_nl": b["used_nl"],
+            "loss_nl": loss,
             "available_nl": (b["initial_volume_nl"]
-                             - b["reserved_nl"] - b["used_nl"]),
+                             - b["reserved_nl"] - b["used_nl"] - loss),
             "recalled": b.get("recalled", False),
             "recalled_reason": b.get("recalled_reason"),
             "recalled_at": b.get("recalled_at"),
@@ -60,8 +62,8 @@ class FakeStore:
             return False, self._pub(existing)
         row = {"id": batch_id, "concentration": concentration,
                "initial_volume_nl": initial_nl, "reserved_nl": 0,
-               "used_nl": 0, "recalled": False, "recalled_reason": None,
-               "recalled_at": None}
+               "used_nl": 0, "loss_nl": 0, "recalled": False,
+               "recalled_reason": None, "recalled_at": None}
         self.batches[batch_id] = row
         return True, self._pub(row)
 
@@ -105,7 +107,7 @@ class FakeStore:
         for bid in sorted(usage):
             b = self.batches[bid]
             available = (b["initial_volume_nl"] - b["reserved_nl"]
-                         - b["used_nl"])
+                         - b["used_nl"] - b.get("loss_nl", 0))
             if available < usage[bid]:
                 shortages.append({"batch_id": bid,
                                   "required_nl": usage[bid],

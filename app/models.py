@@ -206,6 +206,28 @@ class RecallIn(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Physical stocktaking (inventory counts)
+# --------------------------------------------------------------------------- #
+
+# Volumes are stored as BIGINT; anything outside the signed 64-bit range is
+# an out-of-range volume and rejected with 400 like any other illegal value.
+_MAX_BIGINT = 9_223_372_036_854_775_807
+
+
+class StocktakeIn(BaseModel):
+    """One physical count of a registered batch's unreserved volume.
+
+    ``measured_available_nl`` is the actually measured volume (integer nL,
+    >= 0) physically present and not reserved. The service adjudicates it
+    against the locked book state: a deficit moves from the unreserved
+    available pool into the cumulative loss; a surplus only offsets losses
+    confirmed by earlier stocktakes -- it never grows the initial
+    registration, used volume or existing reservations.
+    """
+    measured_available_nl: int = Field(ge=0, le=_MAX_BIGINT)
+
+
+# --------------------------------------------------------------------------- #
 # Stepwise execution
 # --------------------------------------------------------------------------- #
 

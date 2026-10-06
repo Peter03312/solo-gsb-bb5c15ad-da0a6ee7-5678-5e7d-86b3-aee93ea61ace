@@ -21,8 +21,11 @@ from .db import (
     get_frozen,
     get_recall,
     get_reservation,
+    get_stocktake,
     list_batches,
+    list_stocktakes,
     recall_batch,
+    record_stocktake,
     register_step,
     reserve_and_freeze,
     seal_execution_review,
@@ -35,6 +38,7 @@ from .models import (
     PlanRequest,
     RecallIn,
     StepRegistrationIn,
+    StocktakeIn,
 )
 from .planning import (
     build_inventory_problem,
@@ -48,6 +52,7 @@ from .planning import (
     review_content_hash,
     stepwise_progress,
     stock_usage_from_plan,
+    stocktake_content_hash,
     traced_wells_for_batch,
     traced_wells_for_executed_steps,
     transfers_match,
@@ -66,7 +71,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Microplate Dilution Planner",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "Computes an exact, executable pipetting plan for microplate wells. "
         "Volumes are integer nanoliters; concentrations are rationals. "
@@ -79,7 +84,11 @@ app = FastAPI(
         "irrevocably recalled: new reservations and pending steps/confirms "
         "are rejected, and the frozen recall report traces affected plans "
         "and target wells (for stepwise plans, only the executed path) "
-        "through intermediate liquids."
+        "through intermediate liquids. Physical stocktakes reconcile the "
+        "book balance with the measured volume: deficits move from the "
+        "unreserved available pool into a cumulative loss, surpluses only "
+        "offset previously confirmed losses, and every count is sealed "
+        "atomically with its before/after snapshot."
     ),
     lifespan=lifespan,
 )
@@ -346,6 +355,105 @@ async def get_recall_route(batch_id: str):
                      "detail": f"batch {batch_id!r} has not been recalled"},
         )
     return result
+
+
+# --------------------------------------------------------------------------- #
+# Physical stocktaking (inventory counts)
+# --------------------------------------------------------------------------- #
+
+
+@app.post("/batches/{batch_id}/stocktakes")
+async def create_stocktake(
+    batch_id: str,
+    req: StocktakeIn,
+    stocktake_id: str = Header(..., alias="X-Stocktake-ID"),
+):
+    """Reconcile a batch's book balance with a physical count.
+
+    The count is adjudicated against the batch row locked ``FOR UPDATE`` --
+    the same lock every inventory mutation takes first -- so concurrent plan
+    creation, confirm/cancel, stepwise registration and recalls are all
+    settled on the same authoritative state. A deficit moves from the
+    unreserved available pool into the cumulative loss; a surplus only
+    offsets previously confirmed losses. The balance change and the
+    before/after snapshot are sealed in one transaction; failures change
+    nothing.
+    """
+    if not stocktake_id or not stocktake_id.strip():
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_request",
+                     "detail": "X-Stocktake-ID header is required"},
+        )
+    stocktake_id = stocktake_id.strip()
+
+    chash = stocktake_content_hash(batch_id, req.measured_available_nl)
+    outcome, data = await record_stocktake(
+        app.state.db, stocktake_id, batch_id, req.measured_available_nl,
+        chash)
+    if outcome == "unknown":
+        return JSONResponse(
+            status_code=404,
+            content={"error": "unknown_batch",
+                     "detail": f"no batch registered with id {batch_id!r}"},
+        )
+    if outcome == "replay":
+        return JSONResponse(status_code=200, content=data)
+    if outcome == "conflict":
+        return JSONResponse(
+            status_code=409,
+            content={"error": "stocktake_conflict",
+                     "detail": "X-Stocktake-ID is already sealed with "
+                               "different stocktake content",
+                     "stocktake_id": stocktake_id,
+                     "existing_batch_id": data["existing_batch_id"]},
+        )
+    if outcome == "recalled":
+        return JSONResponse(
+            status_code=409,
+            content={"error": "batch_recalled",
+                     "detail": f"batch {batch_id!r} has been recalled; "
+                               "stocktakes are forbidden",
+                     "batch_id": batch_id,
+                     "recalled_reason": data["recalled_reason"],
+                     "recalled_at": data["recalled_at"]},
+        )
+    if outcome == "surplus_exceeded":
+        return JSONResponse(
+            status_code=409,
+            content={"error": "surplus_exceeds_loss",
+                     "detail": "the measured surplus exceeds the cumulative "
+                               "loss confirmed by earlier stocktakes; a "
+                               "surplus can only offset previously confirmed "
+                               "losses",
+                     **data},
+        )
+    return JSONResponse(status_code=201, content=data)
+
+
+@app.get("/batches/{batch_id}/stocktakes")
+async def stocktake_history(batch_id: str):
+    records = await list_stocktakes(app.state.db, batch_id)
+    if records is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "unknown_batch",
+                     "detail": f"no batch registered with id {batch_id!r}"},
+        )
+    return {"batch_id": batch_id, "stocktakes": records}
+
+
+@app.get("/stocktakes/{stocktake_id}")
+async def read_stocktake(stocktake_id: str):
+    record = await get_stocktake(app.state.db, stocktake_id)
+    if record is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "not_found",
+                     "detail": f"no sealed stocktake with id "
+                               f"{stocktake_id!r}"},
+        )
+    return record
 
 
 # --------------------------------------------------------------------------- #
